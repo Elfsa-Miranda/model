@@ -1,40 +1,40 @@
-# Enhanced Multi-Modal DMAE Configuration
+# Enhanced Multi-Modal DMAE Configuration - 优化版
 # 增强型多模态DMAE配置文件
 
 # 基础设置
 seed: 42
 output_dir: "./outputs"
-batch_size: 32
+batch_size: 32              # ✅ 建议 ≥16 for contrastive learning
 num_workers: 4
 
 # CSI数据预处理器配置
 csi_preprocessor:
-  num_antennas: 3          # 天线数量
-  num_subcarriers: 114      # 子载波数量
-  time_length: 10        # 时间序列长度
-  stft_window: 64          # STFT窗口大小
-  stft_hop: 16            # STFT跳跃步长
-  patch_size: 8           # 补丁大小
-  normalize: true          # 是否归一化
+  num_antennas: 3
+  num_subcarriers: 114
+  time_length: 10
+  stft_window: 64
+  stft_hop: 16
+  patch_size: 8
+  normalize: true
 
 # 骨骼点预处理器配置
 skeleton_preprocessor:
-  num_joints: 17           # 关节点数量
-  coord_dim: 2             # 坐标维度 (2D)
-  normalize: true          # 是否归一化
+  num_joints: 17
+  coord_dim: 2
+  normalize: true
 
-# 老师模型配置 (RGB骨骼点MAE)
+# 教师模型配置 (RGB骨骼点MAE)
 teacher_model:
   num_joints: 17
   coord_dim: 2
-  embed_dim: 768           # 嵌入维度
-  depth: 12                # Transformer层数
-  num_heads: 12            # 注意力头数
-  decoder_embed_dim: 512   # 解码器嵌入维度
-  decoder_depth: 8         # 解码器层数
-  decoder_num_heads: 16    # 解码器注意力头数
-  mlp_ratio: 4.0          # MLP比例
-  mask_ratio: 0.75         # 掩码比例
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  mlp_ratio: 4.0
+  mask_ratio: 0.75
 
 # 学生模型配置 (CSI多分支)
 student_model:
@@ -47,95 +47,103 @@ student_model:
   mlp_ratio: 4.0
   num_joints: 17
   coord_dim: 2
-  contrast_dim: 256        # 对比学习特征维度
+  contrast_dim: 128         # ✅ 对比学习特征维度(降低到128)
   mask_ratio: 0.75
+  num_antennas: 3
+  use_multi_attn: true      # ✅ 多路径注意力开关
 
-# 损失函数配置
-teacher_loss:
-  loss_type: "mse"         # 损失类型: mse, l1, smooth_l1
-  normalize: false         # 是否归一化目标
-
+# ========== ✅ 增强版组合损失配置 ==========
 combined_loss:
-  mae_weight: 1.0          # MAE损失权重
-  distill_weight: 1.0      # 知识蒸馏损失权重
-  contrast_weight: 0.5     # 对比学习损失权重
-  
+  # 损失权重(关键调优参数)
+  lambda_mae: 1.0           # MAE重建损失权重
+  lambda_distill: 0.05      # ✅ 蒸馏损失权重(降低,防止主导)
+  lambda_contrast: 0.1      # ✅ 对比学习权重
+
+  # 温度参数
+  contrast_temp: 0.1        # ✅ InfoNCE温度(0.07-0.2推荐)
+  distill_temp: 1.0         # 蒸馏温度(1.0-4.0)
+
   # MAE损失配置
   mae_loss_config:
     loss_type: "mse"
     normalize: false
-  
-  # 知识蒸馏损失配置
-  distill_loss_config:
-    loss_type: "l1"        # l1, mse, cosine
-    temperature: 1.0
-    align_layers: null     # 对齐层索引，null表示对齐所有层
-  
-  # 对比学习损失配置
-  contrast_loss_config:
-    use_simplified: true   # 是否使用简化版对比损失
-    margin: 1.0           # 简化版的margin参数
-    temperature: 0.07     # NT-Xent的温度参数
-    normalize: true       # 是否归一化特征
+
+  # ========== ✅ 移除旧的蒸馏/对比配置(已集成到EnhancedCombinedLoss) ==========
+  # distill_loss_config:  # 已废弃
+  # contrast_loss_config: # 已废弃
 
 # 优化器配置
 teacher_optimizer:
-  type: "adamw"            # 优化器类型: adamw, adam, sgd
-  lr: 1.0e-4              # 学习率
-  weight_decay: 1.0e-2    # 权重衰减
-  momentum: 0.9           # SGD动量 (仅SGD使用)
-
-student_optimizer:
   type: "adamw"
   lr: 1.0e-4
   weight_decay: 1.0e-2
 
+student_optimizer:
+  type: "adamw"
+  lr: 1.0e-4              # ✅ 可适当降低(5e-5)以稳定训练
+  weight_decay: 1.0e-2
+
 # 学习率调度器配置
 teacher_scheduler:
-  type: "cosine"           # 调度器类型: cosine, step, warmup
-  T_max: 50               # 余弦退火周期
-  step_size: 30           # StepLR步长
-  gamma: 0.1              # StepLR衰减因子
-  warmup_epochs: 10       # 预热epoch数
-  total_epochs: 50        # 总epoch数
-  base_lr: 1.0e-4         # 基础学习率
+  type: "cosine"
+  T_max: 50
 
 student_scheduler:
   type: "cosine"
   T_max: 100
+  eta_min: 1.0e-6         # ✅ 最小学习率
 
 # 训练配置
-teacher_pretrain_epochs: 0     # 老师模型预训练epoch数
-student_distill_epochs: 100    # 学生模型蒸馏训练epoch数
-save_freq: 10                  # 保存频率 (每N个epoch保存一次)
+teacher_pretrain_epochs: 0      # 跳过教师预训练(假设已有预训练模型)
+student_distill_epochs: 60      # 学生蒸馏训练epoch数
+save_freq: 10                   # 保存频率
 
 # 验证和测试配置
 validation:
-  freq: 1                      # 验证频率 (每N个epoch验证一次)
-  visualize_freq: 10           # 可视化频率
-  num_vis_samples: 4           # 可视化样本数量
+  freq: 1
+  visualize_freq: 10
+  num_vis_samples: 4
 
-# 日志和输出配置
+# ========== ✅ 增强日志配置 ==========
 logging:
-  log_freq: 100               # 日志打印频率 (每N个batch打印一次)
-  tensorboard: true           # 是否使用TensorBoard
-  wandb: false                # 是否使用Weights & Biases
-  
+  log_freq: 50                  # ✅ 降低日志频率(减少输出)
+  tensorboard: true
+  wandb: false
+
+  # ✅ 新增:对比学习可视化
+  log_contrast_similarity: true  # 是否记录相似度矩阵
+  log_feature_norm: true         # 是否记录特征范数
+
 # 模型保存配置
 checkpointing:
-  save_best: true             # 是否保存最佳模型
-  save_last: true             # 是否保存最后一个模型
-  save_freq: 10               # 定期保存频率
-  max_checkpoints: 5          # 最大保存检查点数量
+  save_best: true
+  save_last: true
+  save_freq: 10
+  max_checkpoints: 5
 
 # 硬件配置
 hardware:
-  num_workers: 4              # 数据加载器工作进程数
-  pin_memory: true            # 是否固定内存
-  mixed_precision: false      # 是否使用混合精度训练
+  num_workers: 4
+  pin_memory: true
+  mixed_precision: false        # ✅ 可尝试开启(需要PyTorch ≥1.6)
 
-# 实验配置
+# ========== ✅ 实验跟踪配置 ==========
 experiment:
-  name: "enhanced_dmae"       # 实验名称
-  tags: ["dmae", "csi", "rgb", "contrastive"]  # 实验标签
-  notes: "Enhanced Multi-Modal DMAE for CSI-RGB cross-modal learning"  # 实验说明
+  name: "enhanced_dmae_v2"
+  tags: ["dmae", "csi", "rgb", "infonce", "stable_distill"]
+  notes: |
+    Enhanced Multi-Modal DMAE with:
+    - InfoNCE contrastive learning (one-to-one alignment)
+    - Stable distillation (reduced weight + temperature)
+    - Feature adapters (distill_adapter + contrast_projector)
+    
+    Expected improvements:
+    - Contrast loss > 0 and decreasing
+    - Distill loss stabilized (~1-5 range)
+    - Faster MPJPE convergence
+
+# ========== ✅ 调试模式 ==========
+debug:
+  enabled: false              # 开启后打印详细调试信息
+  check_gradients: false      # 检查梯度流
+  log_first_batch: true       # 记录第一个batch的统计信息

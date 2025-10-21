@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/CLSA" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/DMAE" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/MMFi_dataset" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/PCL" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/dbot" vcs="Git" />
+  </component>
+</project>

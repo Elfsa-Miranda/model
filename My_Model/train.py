@@ -10,6 +10,7 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F   # ✅ 补上这一行
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
@@ -22,7 +23,7 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import TeacherModel, StudentModel
-from losses import CombinedLoss, MAELoss
+from losses import MAELoss, EnhancedCombinedLoss # ✅ 导入新版
 from data_processing import CSIPreprocessor, SkeletonPreprocessor
 from utils import (
     LossTracker, save_checkpoint, load_checkpoint,
@@ -91,8 +92,19 @@ class EnhancedDMAETrainer:
         print_model_info(self.teacher_model, "Teacher Model")
 
         # 初始化损失函数
-        self.teacher_loss_fn = MAELoss(**config.get('teacher_loss', {}))
-        self.combined_loss_fn = CombinedLoss(**config.get('combined_loss', {}))
+        # 教师模型只需要 MAE 重建损失
+        self.teacher_loss_fn = MAELoss(
+            loss_type=config.get('teacher_loss', {}).get('loss_type', 'mse'),
+            normalize=config.get('teacher_loss', {}).get('normalize', False)
+        )
+        self.combined_loss_fn = EnhancedCombinedLoss(
+            mae_weight=config.get('combined_loss', {}).get('mae_weight', 1.0),
+            distill_weight=config.get('combined_loss', {}).get('distill_weight', 0.05),
+            contrast_weight=config.get('combined_loss', {}).get('contrast_weight', 0.2),
+            contrast_temp=config.get('combined_loss', {}).get('contrast_temp', 0.07),
+            distill_temp=config.get('combined_loss', {}).get('distill_temp', 1.0),
+            mae_loss_config=config.get('combined_loss', {}).get('mae_loss_config')
+        )
 
         # 初始化优化器
         self.teacher_optimizer = self._create_optimizer(
@@ -400,18 +412,43 @@ class EnhancedDMAETrainer:
                 self.student_optimizer.zero_grad()
                 student_outputs = self.student_model(csi_patches)
 
-                # 教师模型前向传播
+                # 教师模型前向传播 + 提取对齐特征
                 with torch.no_grad():
                     teacher_features = self.teacher_model.forward_features(rgb_skeleton, mask_ratio=0.0)
+                    teacher_cls = teacher_features[-1][:, 0, :]  # [B, teacher_dim]
 
-                # 计算组合损失
+                    # === 🔧 修复: 保证 teacher 与 student 对比特征维度匹配 ===
+                    student_contrast_dim = student_outputs['contrast_features'].shape[-1]  # 通常是 128
+
+                    if hasattr(self.teacher_model, 'contrast_projector'):
+                        # 如果 TeacherModel 已实现 contrast_projector（推荐做法）
+                        teacher_contrast = self.teacher_model.contrast_projector(teacher_cls)
+                        teacher_contrast = F.normalize(teacher_contrast, dim=-1)
+                    else:
+                        # 临时方案：直接线性映射 teacher_cls 到 student contrast 维度
+                        # ✅ 不改变模型结构即可训练
+                        projection_layer = nn.Linear(teacher_cls.shape[-1], student_contrast_dim).to(self.device)
+                        projection_layer.requires_grad_(False)  # 冻结以防影响优化器
+                        teacher_contrast = projection_layer(teacher_cls)
+                        teacher_contrast = F.normalize(teacher_contrast, dim=-1)
+
+                    # 调试打印（每 200 批打印一次，防止日志太多）
+                    if batch_idx % 200 == 0:
+                        print(f"[DEBUG] Contrast dims: student={student_outputs['contrast_features'].shape[-1]}, "
+                              f"teacher={teacher_contrast.shape[-1]}")
+                        print(f"[DEBUG] Contrast sim example: "
+                              f"{torch.mean(torch.sum(student_outputs['contrast_features'] * teacher_contrast, dim=-1)).item():.4f}")
+
+                # === 计算组合损失 ===
                 total_loss, loss_dict = self.combined_loss_fn(
+                    # MAE
                     student_outputs['reconstructed_patches'], csi_patches, student_outputs['mask'],
                     student_outputs['skeleton_pred'], rgb_skeleton,
+                    # 蒸馏
                     student_outputs['distill_features'], teacher_features,
-                    student_outputs['contrast_features'][:batch_size//2] if batch_size > 1 else student_outputs['contrast_features'][:1],
-                    student_outputs['contrast_features'][batch_size//2:] if batch_size > 1 else student_outputs['contrast_features'][:1],
-                    contrast_labels[:batch_size//2] if batch_size > 1 else contrast_labels[:1]
+                    # 对比 (student vs teacher)
+                    student_outputs['contrast_features'], teacher_contrast,
+                    contrast_labels  # 保留兼容性，不参与 InfoNCE
                 )
 
                 # 反向传播
