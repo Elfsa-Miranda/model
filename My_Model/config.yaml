@@ -1,0 +1,141 @@
+# Enhanced Multi-Modal DMAE Configuration
+# 增强型多模态DMAE配置文件
+
+# 基础设置
+seed: 42
+output_dir: "./outputs"
+batch_size: 32
+num_workers: 4
+
+# CSI数据预处理器配置
+csi_preprocessor:
+  num_antennas: 3          # 天线数量
+  num_subcarriers: 114      # 子载波数量
+  time_length: 10        # 时间序列长度
+  stft_window: 64          # STFT窗口大小
+  stft_hop: 16            # STFT跳跃步长
+  patch_size: 8           # 补丁大小
+  normalize: true          # 是否归一化
+
+# 骨骼点预处理器配置
+skeleton_preprocessor:
+  num_joints: 17           # 关节点数量
+  coord_dim: 2             # 坐标维度 (2D)
+  normalize: true          # 是否归一化
+
+# 老师模型配置 (RGB骨骼点MAE)
+teacher_model:
+  num_joints: 17
+  coord_dim: 2
+  embed_dim: 768           # 嵌入维度
+  depth: 12                # Transformer层数
+  num_heads: 12            # 注意力头数
+  decoder_embed_dim: 512   # 解码器嵌入维度
+  decoder_depth: 8         # 解码器层数
+  decoder_num_heads: 16    # 解码器注意力头数
+  mlp_ratio: 4.0          # MLP比例
+  mask_ratio: 0.75         # 掩码比例
+
+# 学生模型配置 (CSI多分支)
+student_model:
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  mlp_ratio: 4.0
+  num_joints: 17
+  coord_dim: 2
+  contrast_dim: 256        # 对比学习特征维度
+  mask_ratio: 0.75
+
+# 损失函数配置
+teacher_loss:
+  loss_type: "mse"         # 损失类型: mse, l1, smooth_l1
+  normalize: false         # 是否归一化目标
+
+combined_loss:
+  mae_weight: 1.0          # MAE损失权重
+  distill_weight: 1.0      # 知识蒸馏损失权重
+  contrast_weight: 0.5     # 对比学习损失权重
+  
+  # MAE损失配置
+  mae_loss_config:
+    loss_type: "mse"
+    normalize: false
+  
+  # 知识蒸馏损失配置
+  distill_loss_config:
+    loss_type: "l1"        # l1, mse, cosine
+    temperature: 1.0
+    align_layers: null     # 对齐层索引，null表示对齐所有层
+  
+  # 对比学习损失配置
+  contrast_loss_config:
+    use_simplified: true   # 是否使用简化版对比损失
+    margin: 1.0           # 简化版的margin参数
+    temperature: 0.07     # NT-Xent的温度参数
+    normalize: true       # 是否归一化特征
+
+# 优化器配置
+teacher_optimizer:
+  type: "adamw"            # 优化器类型: adamw, adam, sgd
+  lr: 1.0e-4              # 学习率
+  weight_decay: 1.0e-2    # 权重衰减
+  momentum: 0.9           # SGD动量 (仅SGD使用)
+
+student_optimizer:
+  type: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+
+# 学习率调度器配置
+teacher_scheduler:
+  type: "cosine"           # 调度器类型: cosine, step, warmup
+  T_max: 50               # 余弦退火周期
+  step_size: 30           # StepLR步长
+  gamma: 0.1              # StepLR衰减因子
+  warmup_epochs: 10       # 预热epoch数
+  total_epochs: 50        # 总epoch数
+  base_lr: 1.0e-4         # 基础学习率
+
+student_scheduler:
+  type: "cosine"
+  T_max: 100
+
+# 训练配置
+teacher_pretrain_epochs: 0     # 老师模型预训练epoch数
+student_distill_epochs: 100    # 学生模型蒸馏训练epoch数
+save_freq: 10                  # 保存频率 (每N个epoch保存一次)
+
+# 验证和测试配置
+validation:
+  freq: 1                      # 验证频率 (每N个epoch验证一次)
+  visualize_freq: 10           # 可视化频率
+  num_vis_samples: 4           # 可视化样本数量
+
+# 日志和输出配置
+logging:
+  log_freq: 100               # 日志打印频率 (每N个batch打印一次)
+  tensorboard: true           # 是否使用TensorBoard
+  wandb: false                # 是否使用Weights & Biases
+  
+# 模型保存配置
+checkpointing:
+  save_best: true             # 是否保存最佳模型
+  save_last: true             # 是否保存最后一个模型
+  save_freq: 10               # 定期保存频率
+  max_checkpoints: 5          # 最大保存检查点数量
+
+# 硬件配置
+hardware:
+  num_workers: 4              # 数据加载器工作进程数
+  pin_memory: true            # 是否固定内存
+  mixed_precision: false      # 是否使用混合精度训练
+
+# 实验配置
+experiment:
+  name: "enhanced_dmae"       # 实验名称
+  tags: ["dmae", "csi", "rgb", "contrastive"]  # 实验标签
+  notes: "Enhanced Multi-Modal DMAE for CSI-RGB cross-modal learning"  # 实验说明
