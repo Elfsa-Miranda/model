@@ -57,7 +57,10 @@ combined_loss:
   # 损失权重(关键调优参数)
   lambda_mae: 1.0           # MAE重建损失权重
   lambda_distill: 0.05      # ✅ 蒸馏损失权重(降低,防止主导)
-  lambda_contrast: 0.1      # ✅ 对比学习权重
+  lambda_contrast: 0.2      # ✅ 对比学习目标权重
+  
+  # ✅ 新增: Contrast weight warmup 配置
+  contrast_warmup_epochs: 10  # 前 N epoch 从 0 逐步增加到 lambda_contrast
 
   # 温度参数
   contrast_temp: 0.1        # ✅ InfoNCE温度(0.07-0.2推荐)
@@ -67,10 +70,6 @@ combined_loss:
   mae_loss_config:
     loss_type: "mse"
     normalize: false
-
-  # ========== ✅ 移除旧的蒸馏/对比配置(已集成到EnhancedCombinedLoss) ==========
-  # distill_loss_config:  # 已废弃
-  # contrast_loss_config: # 已废弃
 
 # 优化器配置
 teacher_optimizer:
@@ -129,16 +128,20 @@ hardware:
 
 # ========== ✅ 实验跟踪配置 ==========
 experiment:
-  name: "enhanced_dmae_v2"
-  tags: ["dmae", "csi", "rgb", "infonce", "stable_distill"]
+  name: "enhanced_dmae_v3"
+  tags: ["dmae", "csi", "rgb", "infonce", "stable_distill", "warmup", "trainable_projector"]
   notes: |
     Enhanced Multi-Modal DMAE with:
     - InfoNCE contrastive learning (one-to-one alignment)
     - Stable distillation (reduced weight + temperature)
-    - Feature adapters (distill_adapter + contrast_projector)
+    - Trainable teacher->student contrast projector
+    - Contrast weight warmup (0 -> target over N epochs)
+    - Epoch-level statistics reporting (no batch-level prints)
     
     Expected improvements:
     - Contrast loss > 0 and decreasing
+    - PosSim increasing (> 0.2 mid-training, > 0.4 ideal)
+    - NegSim staying low (< PosSim)
     - Distill loss stabilized (~1-5 range)
     - Faster MPJPE convergence
 
