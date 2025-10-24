@@ -10,7 +10,7 @@ Enhanced Multi-Modal DMAE Loss Functions
 
 改进点:
 - 平衡损失权重配置
-- 重写 InfoNCE 对比损失(标准双向实现)
+- 对称双向 InfoNCE 对比损失(student↔teacher)
 - 改进蒸馏损失稳定性(L2-normalization + 余弦距离)
 - 移除 batch 级打印,支持 epoch 级统计汇总
 """
@@ -362,8 +362,12 @@ class SimplifiedContrastiveLoss(nn.Module):
 
 class EnhancedContrastiveLoss(nn.Module):
     """
-    InfoNCE-based contrastive loss for student-teacher embedding alignment.
-    Now supports silent accumulation for epoch-level reporting.
+    ✅ 对称双向 InfoNCE 对比损失 (student ↔ teacher)
+    
+    改进点:
+    - 双向对齐: student→teacher + teacher→student
+    - 减少方向性偏差,提升训练稳定性
+    - 支持 epoch 级统计汇总(silent accumulation)
     """
     def __init__(self, temperature=0.07):
         super().__init__()
@@ -376,39 +380,51 @@ class EnhancedContrastiveLoss(nn.Module):
 
     def forward(self, student_feats, teacher_feats):
         """
+        ✅ 对称 InfoNCE: 双向 student→teacher + teacher→student
+        
         Args:
-            student_feats: [B, D]
-            teacher_feats: [B, D]
+            student_feats: [B, D] 学生特征
+            teacher_feats: [B, D] 教师特征
+        
+        Returns:
+            loss: 对称对比损失
         """
-        # Student/teacher should be normalized before computing logits
+        # 归一化特征(确保范围[-1,1])
         student_feats = F.normalize(student_feats, dim=-1)
         teacher_feats = F.normalize(teacher_feats, dim=-1)
 
-        logits = torch.matmul(student_feats, teacher_feats.T) / self.temperature
+        # 计算双向相似度矩阵
+        logits_s_t = torch.matmul(student_feats, teacher_feats.T) / self.temperature  # [B, B]
+        logits_t_s = torch.matmul(teacher_feats, student_feats.T) / self.temperature  # [B, B]
+
+        # 标签: 对角线为正样本(i→i)
         labels = torch.arange(student_feats.size(0), device=student_feats.device)
-        loss = F.cross_entropy(logits, labels)
 
-        # 仅记录统计,不做任何打印(由 caller 在 epoch 末统一打印)
+        # 计算双向交叉熵损失
+        loss_s_t = F.cross_entropy(logits_s_t, labels)  # student→teacher
+        loss_t_s = F.cross_entropy(logits_t_s, labels)  # teacher→student
+        loss = 0.5 * (loss_s_t + loss_t_s)  # 平均
+
+        # 记录统计(不参与梯度计算)
         with torch.no_grad():
-            # 正样本:对角线均值
-            pos_sim = torch.mean(torch.diag(logits)).item()
-            # 负样本:除对角线外的元素均值
-            neg_sim = ((logits.sum() - torch.diag(logits).sum()) / (logits.numel() - logits.size(0))).item()
+            # 正样本相似度: 对角线均值
+            pos_s_t = torch.mean(torch.diag(logits_s_t)).item()
+            # 负样本相似度: 非对角线均值
+            neg_s_t = ((logits_s_t.sum() - torch.diag(logits_s_t).sum()) /
+                       (logits_s_t.numel() - logits_s_t.size(0))).item()
 
-            self.pos_sims.append(pos_sim)
-            self.neg_sims.append(neg_sim)
+            self.pos_sims.append(pos_s_t)
+            self.neg_sims.append(neg_s_t)
             self.loss_values.append(loss.item())
 
-        # 增加步数计数
         self.step_count += 1
         return loss
 
     def clear_stats(self):
-        """清空内部统计(在每个 epoch 结束时由 trainer 调用)"""
+        """✅ 清空统计缓存(由 Trainer 在每个 epoch 结束时调用)"""
         self.pos_sims.clear()
         self.neg_sims.clear()
         self.loss_values.clear()
-        # 重置 step_count 为 0(buffer 可直接赋值)
         self.step_count.zero_()
 
 
@@ -560,7 +576,7 @@ class EnhancedCombinedLoss(nn.Module):
     增强的组合损失函数
     改进版本:
     1. 调整损失权重平衡
-    2. 使用标准双向 InfoNCE 对比损失
+    2. 使用对称双向 InfoNCE 对比损失
     3. 使用稳定的余弦距离蒸馏损失
     4. 支持动态权重更新
     """
@@ -591,7 +607,7 @@ class EnhancedCombinedLoss(nn.Module):
         mae_config = mae_loss_config or {}
         self.mae_loss = MAELoss(**mae_config)
 
-        # 使用增强的对比损失(标准双向 InfoNCE)
+        # ✅ 使用对称双向 InfoNCE 对比损失
         self.contrast_loss = EnhancedContrastiveLoss(temperature=contrast_temp)
 
         # 使用稳定的蒸馏损失
@@ -657,7 +673,7 @@ class EnhancedCombinedLoss(nn.Module):
         distill_loss = distill_total_loss / num_layers if num_layers > 0 else torch.tensor(0.0)
         loss_dict['distill_loss'] = distill_loss
 
-        # 3. 对比学习损失(使用增强版本,不依赖 labels)
+        # 3. ✅ 对称双向 InfoNCE 对比学习损失
         contrast_loss = self.contrast_loss(anchor_contrast_feat, positive_contrast_feat)
         loss_dict['contrast_loss'] = contrast_loss
 
@@ -762,10 +778,10 @@ def test_contrastive_loss():
     ntxent_loss = ntxent_loss_fn(anchor_features, positive_features, labels)
     print(f"NT-Xent对比学习损失: {ntxent_loss.item():.4f}")
 
-    # 测试增强版对比损失(标准双向 InfoNCE)
+    # 测试增强版对比损失(对称双向 InfoNCE)
     enhanced_loss_fn = EnhancedContrastiveLoss(temperature=0.07)
     enhanced_loss = enhanced_loss_fn(anchor_features, positive_features)
-    print(f"增强对比学习损失 (InfoNCE): {enhanced_loss.item():.4f}")
+    print(f"增强对比学习损失 (对称InfoNCE): {enhanced_loss.item():.4f}")
 
     print("✅ 对比学习损失测试通过")
 

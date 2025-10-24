@@ -1,6 +1,14 @@
 """
-Enhanced Multi-Modal DMAE Training Pipeline - 修复版
-修复内容: 解决学生模型初始化和optimizer为None的问题
+Enhanced Multi-Modal DMAE Training Pipeline - 最终优化版
+
+改进内容:
+1. 修复 scheduler/optimizer 调用顺序问题
+2. 对称双向 InfoNCE 对比损失
+3. 可训练的 teacher contrast projector
+4. Contrast weight warmup机制
+5. 自动时间戳或自定义 run_name 保存
+6. 移除batch级别debug打印
+7. Epoch级别统计汇总
 """
 
 import os
@@ -10,20 +18,21 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F   # ✅ 补上这一行
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import time
 import re
+import datetime
 from pathlib import Path
 
 # 添加路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import TeacherModel, StudentModel
-from losses import MAELoss, EnhancedCombinedLoss # ✅ 导入新版
+from losses import MAELoss, EnhancedCombinedLoss
 from data_processing import CSIPreprocessor, SkeletonPreprocessor
 from utils import (
     LossTracker, save_checkpoint, load_checkpoint,
@@ -86,25 +95,36 @@ class EnhancedDMAETrainer:
         # 学生模型延迟初始化
         self.student_model = None
         self.student_model_config = config['student_model']
-        print("⚠️  学生模型将在第一次使用时初始化（等待 num_patches 确定）")
+        print("⚠️  学生模型将在第一次使用时初始化(等待 num_patches 确定)")
 
         # 打印模型信息
         print_model_info(self.teacher_model, "Teacher Model")
 
         # 初始化损失函数
-        # 教师模型只需要 MAE 重建损失
         self.teacher_loss_fn = MAELoss(
             loss_type=config.get('teacher_loss', {}).get('loss_type', 'mse'),
             normalize=config.get('teacher_loss', {}).get('normalize', False)
         )
+        
+        combined_cfg = config.get('combined_loss', {})
         self.combined_loss_fn = EnhancedCombinedLoss(
-            mae_weight=config.get('combined_loss', {}).get('mae_weight', 1.0),
-            distill_weight=config.get('combined_loss', {}).get('distill_weight', 0.05),
-            contrast_weight=config.get('combined_loss', {}).get('contrast_weight', 0.2),
-            contrast_temp=config.get('combined_loss', {}).get('contrast_temp', 0.07),
-            distill_temp=config.get('combined_loss', {}).get('distill_temp', 1.0),
-            mae_loss_config=config.get('combined_loss', {}).get('mae_loss_config')
+            mae_weight=combined_cfg.get('lambda_mae', 1.0),
+            distill_weight=combined_cfg.get('lambda_distill', 0.05),
+            contrast_weight=combined_cfg.get('lambda_contrast', 0.1),
+            contrast_temp=combined_cfg.get('contrast_temp', 0.1),
+            distill_temp=combined_cfg.get('distill_temp', 1.0),
+            mae_loss_config=combined_cfg.get('mae_loss_config')
         )
+
+        # teacher->student contrast projector support
+        self.teacher_contrast_projector = None
+        if hasattr(self.teacher_model, 'contrast_projector'):
+            print("Using teacher_model.contrast_projector (found on TeacherModel).")
+            self.teacher_contrast_projector = self.teacher_model.contrast_projector
+        
+        # dynamic contrast warmup config
+        self.contrast_target = combined_cfg.get('lambda_contrast', 0.2)
+        self.contrast_warmup_epochs = combined_cfg.get('contrast_warmup_epochs', 0)
 
         # 初始化优化器
         self.teacher_optimizer = self._create_optimizer(
@@ -120,6 +140,10 @@ class EnhancedDMAETrainer:
         self.student_scheduler = None
         self.student_scheduler_config = config.get('student_scheduler', {})
 
+        # ✅ 记录 optimizer 是否 step,用于 lr_scheduler 警告修复
+        self._student_optimizer_stepped = False
+        self._teacher_optimizer_stepped = False
+
         # 训练状态
         self.teacher_start_epoch = 0
         self.student_start_epoch = 0
@@ -127,9 +151,22 @@ class EnhancedDMAETrainer:
         self.best_loss = float('inf')
         self.loss_tracker = LossTracker()
 
-        # 输出目录
-        self.output_dir = config.get('output_dir', './outputs')
+        # ✅ 输出目录 - 支持时间戳和自定义 run_name
+        base_dir = config.get('output_dir', './outputs')
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        run_name = config.get('run_name', None)
+        if not run_name:
+            run_name = f"run_{timestamp}"
+        self.output_dir = os.path.join(base_dir, run_name)
+        
+        # 创建子目录
         os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'student_checkpoints'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'teacher_checkpoints'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'tensorboard_logs'), exist_ok=True)
+        
+        print(f"✅ 当前训练输出目录: {self.output_dir}")
 
         # 日志文件
         self.log_file = os.path.join(self.output_dir, 'training_log.json')
@@ -141,9 +178,11 @@ class EnhancedDMAETrainer:
             self.tb_log_dir = os.path.join(self.output_dir, 'tensorboard_logs')
             os.makedirs(self.tb_log_dir, exist_ok=True)
             self.writer = SummaryWriter(self.tb_log_dir)
-            print(f"✅ TensorBoard日志目录: {self.tb_log_dir}")
+            print(f"✅ TensorBoard日志已启用: {self.tb_log_dir}")
         else:
             self.writer = None
+
+        print("✅ 日志与检查点分类保存初始化完毕")
 
         # 恢复训练
         if resume_teacher:
@@ -153,7 +192,7 @@ class EnhancedDMAETrainer:
             self._resume_student_training(resume_student)
 
     def _initialize_student_model(self):
-        """初始化学生模型（在第一次使用时调用）"""
+        """初始化学生模型(在第一次使用时调用)"""
         if self.student_model is not None:
             return
 
@@ -172,9 +211,14 @@ class EnhancedDMAETrainer:
 
         print_model_info(self.student_model, "Student Model")
 
-        # 创建优化器
-        self.student_optimizer = self._create_optimizer(
-            self.student_model, self.student_optimizer_config
+        # 创建优化器(包含projector参数)
+        optimizer_params = list(self.student_model.parameters())
+        if self.teacher_contrast_projector is not None:
+            optimizer_params += list(self.teacher_contrast_projector.parameters())
+        
+        self.student_optimizer = self._create_optimizer_from_params(
+            optimizer_params,
+            self.student_optimizer_config
         )
 
         # 创建学习率调度器
@@ -212,7 +256,7 @@ class EnhancedDMAETrainer:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
             if self.student_model is None:
-                print("⚠️  学生模型尚未初始化，正在从检查点恢复...")
+                print("⚠️  学生模型尚未初始化,正在从检查点恢复...")
                 self.student_start_epoch = checkpoint.get('epoch', 0)
                 self.best_loss = checkpoint.get('loss', float('inf'))
                 print(f"✅ 学生模型检查点信息已记录: 已完成 Epoch {self.student_start_epoch}")
@@ -246,6 +290,24 @@ class EnhancedDMAETrainer:
         elif optimizer_type.lower() == 'sgd':
             momentum = optimizer_config.get('momentum', 0.9)
             optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum)
+        else:
+            raise ValueError(f"不支持的优化器类型: {optimizer_type}")
+
+        return optimizer
+
+    def _create_optimizer_from_params(self, params, optimizer_config):
+        """创建优化器:从给定 params 列表创建(用于合并 projector)"""
+        optimizer_type = optimizer_config.get('type', 'adamw')
+        lr = optimizer_config.get('lr', 1e-4)
+        weight_decay = optimizer_config.get('weight_decay', 1e-2)
+
+        if optimizer_type.lower() == 'adamw':
+            optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'adam':
+            optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'sgd':
+            momentum = optimizer_config.get('momentum', 0.9)
+            optimizer = optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=momentum)
         else:
             raise ValueError(f"不支持的优化器类型: {optimizer_type}")
 
@@ -304,12 +366,12 @@ class EnhancedDMAETrainer:
         print("阶段2: 学生模型蒸馏训练")
         print("=" * 60)
 
-        # ✅ 关键修复：确保学生模型已初始化
+        # ✅ 确保学生模型已初始化
         if self.student_model is None:
-            print("🔍 学生模型尚未初始化，正在初始化...")
+            print("🔍 学生模型尚未初始化,正在初始化...")
 
             if not hasattr(self, 'train_loader') or self.train_loader is None:
-                raise RuntimeError("数据加载器未初始化！请先调用 load_data() 方法。")
+                raise RuntimeError("数据加载器未初始化!请先调用 load_data() 方法。")
 
             try:
                 print("   正在获取样本批次...")
@@ -323,7 +385,7 @@ class EnhancedDMAETrainer:
                     print(f"   检测到标准格式: {csi_sample_reshaped.shape}")
                 elif csi_sample.shape[-1] == 3:
                     csi_sample_reshaped = csi_sample.permute(0, 3, 1, 2)[:1]
-                    print(f"   检测到MMFi格式，已转换: {csi_sample_reshaped.shape}")
+                    print(f"   检测到MMFi格式,已转换: {csi_sample_reshaped.shape}")
                 else:
                     raise ValueError(f"无法识别的CSI数据格式: {csi_sample.shape}")
 
@@ -331,7 +393,7 @@ class EnhancedDMAETrainer:
                 patches, _ = self.csi_preprocessor(csi_sample_reshaped)
 
                 if self.csi_preprocessor.num_patches is None:
-                    raise RuntimeError(f"CSI预处理器未能确定 num_patches！patches shape: {patches.shape}")
+                    raise RuntimeError(f"CSI预处理器未能确定 num_patches! patches shape: {patches.shape}")
 
                 print(f"   ✅ num_patches 已确定: {self.csi_preprocessor.num_patches}")
 
@@ -339,19 +401,16 @@ class EnhancedDMAETrainer:
                 self._initialize_student_model()
                 print("   ✅ 学生模型初始化完成")
 
-                # === GPT5 FIX START: 记录预期patch数，确保一致 ===
+                # 记录预期patch数
                 self.student_model.init_grid = self.csi_preprocessor.patch_grid
                 self.student_model.expected_grid = self.csi_preprocessor.patch_grid
                 self.expected_num_patches = self.csi_preprocessor.num_patches
 
                 print(f"✅ Student expected patch grid: {self.expected_num_patches} "
                       f"({self.csi_preprocessor.patch_grid[0]}×{self.csi_preprocessor.patch_grid[1]}×{self.csi_preprocessor.num_antennas})")
-                # === GPT5 FIX END ===
-
-
 
             except StopIteration:
-                raise RuntimeError("数据加载器为空！请检查数据集是否正确加载。")
+                raise RuntimeError("数据加载器为空!请检查数据集是否正确加载。")
             except Exception as e:
                 print(f"   ❌ 初始化失败: {e}")
                 import traceback
@@ -379,6 +438,19 @@ class EnhancedDMAETrainer:
 
         for epoch in range(start_epoch, total_epochs):
             actual_epoch = epoch + 1
+
+            # ✅ 计算动态 contrast weight (warmup)
+            if self.contrast_warmup_epochs > 0:
+                if actual_epoch <= self.contrast_warmup_epochs:
+                    cur_weight = self.contrast_target * (actual_epoch / float(self.contrast_warmup_epochs))
+                else:
+                    cur_weight = self.contrast_target
+            else:
+                cur_weight = self.contrast_target
+            
+            # 设置到 combined_loss_fn
+            if hasattr(self.combined_loss_fn, 'contrast_weight'):
+                self.combined_loss_fn.contrast_weight = cur_weight
 
             epoch_start_time = time.time()
             self.loss_tracker.reset_current()
@@ -417,27 +489,26 @@ class EnhancedDMAETrainer:
                     teacher_features = self.teacher_model.forward_features(rgb_skeleton, mask_ratio=0.0)
                     teacher_cls = teacher_features[-1][:, 0, :]  # [B, teacher_dim]
 
-                    # === 🔧 修复: 保证 teacher 与 student 对比特征维度匹配 ===
-                    student_contrast_dim = student_outputs['contrast_features'].shape[-1]  # 通常是 128
+                # ✅ contrast projector (lazy创建,可训练)
+                if hasattr(self.teacher_model, 'contrast_projector'):
+                    teacher_contrast = self.teacher_model.contrast_projector(teacher_cls)
+                else:
+                    # lazy-create projector on first batch
+                    if self.teacher_contrast_projector is None:
+                        student_contrast_dim = student_outputs['contrast_features'].shape[-1]
+                        teacher_cls_dim = teacher_cls.shape[-1]
+                        self.teacher_contrast_projector = nn.Linear(teacher_cls_dim, student_contrast_dim).to(self.device)
+                        
+                        # 重建optimizer包含projector参数
+                        optimizer_params = list(self.student_model.parameters()) + list(self.teacher_contrast_projector.parameters())
+                        self.student_optimizer = self._create_optimizer_from_params(optimizer_params, self.student_optimizer_config)
+                        print(f"[Info] Created teacher_contrast_projector lazily: {teacher_cls_dim} -> {student_contrast_dim}")
+                    
+                    teacher_contrast = self.teacher_contrast_projector(teacher_cls)
 
-                    if hasattr(self.teacher_model, 'contrast_projector'):
-                        # 如果 TeacherModel 已实现 contrast_projector（推荐做法）
-                        teacher_contrast = self.teacher_model.contrast_projector(teacher_cls)
-                        teacher_contrast = F.normalize(teacher_contrast, dim=-1)
-                    else:
-                        # 临时方案：直接线性映射 teacher_cls 到 student contrast 维度
-                        # ✅ 不改变模型结构即可训练
-                        projection_layer = nn.Linear(teacher_cls.shape[-1], student_contrast_dim).to(self.device)
-                        projection_layer.requires_grad_(False)  # 冻结以防影响优化器
-                        teacher_contrast = projection_layer(teacher_cls)
-                        teacher_contrast = F.normalize(teacher_contrast, dim=-1)
-
-                    # 调试打印（每 200 批打印一次，防止日志太多）
-                    if batch_idx % 200 == 0:
-                        print(f"[DEBUG] Contrast dims: student={student_outputs['contrast_features'].shape[-1]}, "
-                              f"teacher={teacher_contrast.shape[-1]}")
-                        print(f"[DEBUG] Contrast sim example: "
-                              f"{torch.mean(torch.sum(student_outputs['contrast_features'] * teacher_contrast, dim=-1)).item():.4f}")
+                # ✅ normalize contrast features (确保传入归一化特征)
+                teacher_contrast = F.normalize(teacher_contrast, dim=-1)
+                student_contrast = F.normalize(student_outputs['contrast_features'], dim=-1)
 
                 # === 计算组合损失 ===
                 total_loss, loss_dict = self.combined_loss_fn(
@@ -446,14 +517,17 @@ class EnhancedDMAETrainer:
                     student_outputs['skeleton_pred'], rgb_skeleton,
                     # 蒸馏
                     student_outputs['distill_features'], teacher_features,
-                    # 对比 (student vs teacher)
-                    student_outputs['contrast_features'], teacher_contrast,
-                    contrast_labels  # 保留兼容性，不参与 InfoNCE
+                    # 对比 (使用归一化特征)
+                    student_contrast, teacher_contrast,
+                    contrast_labels  # 保留兼容性
                 )
 
                 # 反向传播
                 total_loss.backward()
                 self.student_optimizer.step()
+                
+                # ✅ 标记 optimizer.step() 已调用(修复 UserWarning)
+                self._student_optimizer_stepped = True
 
                 # 更新损失
                 self.loss_tracker.update(loss_dict, csi_patches.shape[0])
@@ -467,8 +541,8 @@ class EnhancedDMAETrainer:
                     'Contrast': f"{current_losses.get('contrast_loss', 0):.4f}"
                 })
 
-            # 学习率调度
-            if self.student_scheduler:
+            # ✅ 学习率调度(必须在 optimizer.step() 之后调用)
+            if self.student_scheduler and self._student_optimizer_stepped:
                 self.student_scheduler.step()
 
             # 验证
@@ -476,68 +550,27 @@ class EnhancedDMAETrainer:
 
             # 保存epoch损失
             self.loss_tracker.current_losses['student_val_loss'].update(val_loss)
-            # 保存epoch损失
-            self.loss_tracker.current_losses['student_val_loss'].update(val_loss)
 
-            # 将 val_metrics 中的每项转换为可供 AverageMeter.update() 接受的单一标量（取均值）
+            # 将 val_metrics 转换为标量
             for key, value in val_metrics.items():
-                # 默认跳过不能处理的类型
                 scalar_value = None
 
-                # list -> 取均值（适用于 joint_errors 列表）
                 if isinstance(value, (list, tuple)):
                     try:
                         scalar_value = float(np.mean(value))
                     except Exception:
-                        # 如果列表内含非数值，跳过记录
                         continue
-
-                # torch.Tensor -> 标量或均值
                 elif isinstance(value, torch.Tensor):
                     if value.numel() == 1:
                         scalar_value = float(value.item())
                     else:
                         scalar_value = float(value.mean().item())
-
-                # 直接是数值
                 elif isinstance(value, (float, int, np.floating, np.integer)):
                     scalar_value = float(value)
-
-                # 其他类型跳过
                 else:
                     continue
 
-                # 更新到 loss_tracker（AverageMeter 期望一个数值）
                 self.loss_tracker.current_losses[f'val_{key}'].update(scalar_value)
-
-            # （可选）把 PCK 单独写入 TensorBoard（原来逻辑）
-            for key, value in val_metrics.items():
-                if self.writer and key.startswith('PCK@'):
-                    # 确保传入的是标量
-                    if isinstance(value, torch.Tensor):
-                        if value.numel() == 1:
-                            v = float(value.item())
-                        else:
-                            v = float(value.mean().item())
-                    elif isinstance(value, (list, tuple)):
-                        v = float(np.mean(value))
-                    else:
-                        v = float(value)
-                    self.writer.add_scalar(f'Student/Val_{key}', v, actual_epoch)
-
-            # TensorBoard记录
-            if self.writer:
-                self.writer.add_scalar('Student/Train_Total_Loss', current_losses.get('total_loss', 0), actual_epoch)
-                self.writer.add_scalar('Student/Train_MAE_Loss', current_losses.get('mae_total_loss', 0), actual_epoch)
-                self.writer.add_scalar('Student/Train_Distill_Loss', current_losses.get('distill_loss', 0), actual_epoch)
-                self.writer.add_scalar('Student/Train_Contrast_Loss', current_losses.get('contrast_loss', 0), actual_epoch)
-                self.writer.add_scalar('Student/Val_Loss', val_loss, actual_epoch)
-                self.writer.add_scalar('Student/Val_MPJPE', val_metrics.get('MPJPE', 0), actual_epoch)
-                self.writer.add_scalar('Student/Learning_Rate', self.student_optimizer.param_groups[0]['lr'], actual_epoch)
-
-                for key, value in val_metrics.items():
-                    if key.startswith('PCK@'):
-                        self.writer.add_scalar(f'Student/Val_{key}', value, actual_epoch)
 
             # 保存检查点
             is_best = val_loss < self.best_loss
@@ -554,14 +587,70 @@ class EnhancedDMAETrainer:
                     is_best
                 )
 
-            # 打印epoch信息
+            # ✅ --- epoch summary + contrast summary ---
             best_marker = " 🎯 Best!" if is_best else ""
             epoch_time = time.time() - epoch_start_time
+
+            # Get train losses
+            train_losses = current_losses
+            train_loss_val = float(train_losses.get('total_loss', 0))
+            mae_val = float(train_losses.get('mae_total_loss', 0))
+
+            # ✅ Contrast summary: 从 contrast_loss 模块读取统计
+            contrast_module = getattr(self.combined_loss_fn, 'contrast_loss', None)
+            contrast_summary_str = ""
+            if contrast_module is not None and hasattr(contrast_module, 'loss_values') and len(contrast_module.loss_values) > 0:
+                pos_mean = float(np.mean(contrast_module.pos_sims))
+                neg_mean = float(np.mean(contrast_module.neg_sims))
+                contrast_mean = float(np.mean(contrast_module.loss_values))
+                contrast_summary_str = f" [Contrast] Loss={contrast_mean:.4f}, PosSim={pos_mean:.4f}, NegSim={neg_mean:.4f}"
+
+                # 写入 TensorBoard
+                if self.writer:
+                    self.writer.add_scalar('Student/Contrast_PosSim', pos_mean, actual_epoch)
+                    self.writer.add_scalar('Student/Contrast_NegSim', neg_mean, actual_epoch)
+                    self.writer.add_scalar('Student/Contrast_Loss_Mean', contrast_mean, actual_epoch)
+
+                # ✅ 清空统计
+                if hasattr(contrast_module, 'clear_stats'):
+                    contrast_module.clear_stats()
+                else:
+                    contrast_module.pos_sims.clear()
+                    contrast_module.neg_sims.clear()
+                    contrast_module.loss_values.clear()
+
+            # TensorBoard 记录
+            if self.writer:
+                self.writer.add_scalar('Student/Train_Total_Loss', train_loss_val, actual_epoch)
+                self.writer.add_scalar('Student/Train_MAE_Loss', mae_val, actual_epoch)
+                self.writer.add_scalar('Student/Train_Distill_Loss', train_losses.get('distill_loss', 0), actual_epoch)
+                self.writer.add_scalar('Student/Train_Contrast_Loss', train_losses.get('contrast_loss', 0), actual_epoch)
+                self.writer.add_scalar('Student/Val_Loss', val_loss, actual_epoch)
+                self.writer.add_scalar('Student/Val_MPJPE', val_metrics.get('MPJPE', 0), actual_epoch)
+                self.writer.add_scalar('Student/Learning_Rate', self.student_optimizer.param_groups[0]['lr'], actual_epoch)
+                self.writer.add_scalar('Student/Contrast_Weight', cur_weight, actual_epoch)
+
+                # PCK metrics
+                for key, value in val_metrics.items():
+                    if key.startswith('PCK@'):
+                        if isinstance(value, torch.Tensor):
+                            if value.numel() == 1:
+                                v = float(value.item())
+                            else:
+                                v = float(value.mean().item())
+                        elif isinstance(value, (list, tuple)):
+                            v = float(np.mean(value))
+                        else:
+                            v = float(value)
+                        self.writer.add_scalar(f'Student/Val_{key}', v, actual_epoch)
+
+            # ✅ 单行epoch summary打印
             print(f"Epoch {actual_epoch}/{total_epochs} - "
-                  f"Train Loss: {current_losses.get('total_loss', 0):.4f}, "
+                  f"Train Loss: {train_loss_val:.4f}, "
                   f"Val Loss: {val_loss:.4f}, "
-                  f"Val MPJPE: {val_metrics.get('MPJPE', 0):.4f}, "
-                  f"Time: {epoch_time:.2f}s{best_marker}")
+                  f"MPJPE: {val_metrics.get('MPJPE', 0):.4f}"
+                  f"{contrast_summary_str}{best_marker} "
+                  f"Time: {epoch_time:.2f}s")
 
         # 更新起始epoch
         self.student_start_epoch = total_epochs
@@ -691,6 +780,9 @@ def main():
 
   # 恢复学生模型训练
   python train.py <dataset_root> <config_file> --config config.yaml --resume_student ./outputs/student_checkpoints/best_model.pth
+  
+  # 自定义运行名称
+  python train.py <dataset_root> <config_file> --config config.yaml --run_name experiment_v1
         """
     )
 
@@ -701,6 +793,9 @@ def main():
     parser.add_argument('--resume_teacher', type=str, default=None, help='教师模型检查点路径')
     parser.add_argument('--resume_student', type=str, default=None, help='学生模型检查点路径')
     parser.add_argument('--auto_resume', action='store_true', help='自动恢复最新检查点')
+    
+    # ✅ 新增：允许自定义运行名称（避免每次覆盖）
+    parser.add_argument('--run_name', type=str, default=None, help='自定义当前训练 run 名称')
 
     args = parser.parse_args()
 
@@ -711,6 +806,8 @@ def main():
     print(f"数据集配置: {args.config_file}")
     print(f"训练配置: {args.config}")
     print(f"输出目录: {args.output_dir}")
+    if args.run_name:
+        print(f"运行名称: {args.run_name}")
     print("=" * 80)
 
     # 验证路径
@@ -730,6 +827,11 @@ def main():
     try:
         config = load_config(args.config)
         config['output_dir'] = args.output_dir
+        
+        # ✅ 设置 run_name
+        if args.run_name:
+            config['run_name'] = args.run_name
+        
         print("✅ 训练配置加载成功")
     except Exception as e:
         print(f"❌ 错误: 无法加载训练配置: {e}")
@@ -741,8 +843,14 @@ def main():
 
     if args.auto_resume:
         print("\n检查是否存在检查点...")
-        teacher_checkpoint_dir = os.path.join(args.output_dir, 'teacher_checkpoints')
-        student_checkpoint_dir = os.path.join(args.output_dir, 'student_checkpoints')
+        # ✅ 根据 run_name 确定检查点目录
+        if args.run_name:
+            base_checkpoint_dir = os.path.join(args.output_dir, args.run_name)
+        else:
+            base_checkpoint_dir = args.output_dir
+            
+        teacher_checkpoint_dir = os.path.join(base_checkpoint_dir, 'teacher_checkpoints')
+        student_checkpoint_dir = os.path.join(base_checkpoint_dir, 'student_checkpoints')
 
         if resume_teacher is None:
             latest_teacher, _ = get_latest_checkpoint(teacher_checkpoint_dir, "teacher")
@@ -777,7 +885,7 @@ def main():
         print("\n开始训练流程...")
         trainer.train(args.dataset_root, args.config_file)
         print("\n" + "=" * 80)
-        print("🎉 训练完成！")
+        print("🎉 训练完成!")
         print("=" * 80)
     except KeyboardInterrupt:
         print("\n⚠️  训练被用户中断")
